@@ -6,7 +6,19 @@ tags: [GitHub, GitHub Copilot, Security, Governance, MCP, VS Code, Copilot CLI, 
 description: "A walkthrough of the governance gaps in the GitHub Copilot and extension surfaces: the Copilot CLI with its plugin marketplace, the Agent Package Manager (APM), gh skills, MCP servers across editors, and VS Code extensions through the Microsoft Marketplace and Open VSX."
 ---
 
-A lot of the recent additions to the Copilot ecosystem add real value for individual developers, but they also expand the surface that an enterprise has to reason about. Most of these new entry points let a developer pull executable instructions, configuration, or full processes from any random repository on the internet, with very little or no central control. This post looks at the five places where I think the gap between "useful for one engineer" and "safe to run across a 5,000 person org" is widest right now.
+A lot of the recent additions to the GitHub Copilot ecosystem add real value for individual developers, yet they also expand the security surface that an enterprise has to reason about. Most of these new entry points let a developer pull executable instructions, configuration, or full processes from any random repository on the internet, with very little or no central control. This post looks at the five places where I think the gap between "useful for one engineer" and "safe to run across a 5,000 person org" is widest right now.
+
+We'll look at these topis:
+- GitHub Copilot CLI plugin marketplace
+- Agent Package Manager (APM)
+- `gh skill` now in the GitHub CLI
+- MCP servers across editors
+- VS Code extensions and the different registries
+
+
+![Samuel Regan Asante from Unsplash](/images/2026/20260501/samuel-regan-asante-STDn0DxY8os-unsplash.jpg)
+##### Photo by <a href="https://unsplash.com/@reganography?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Samuel Regan-Asante</a> on <a href="https://unsplash.com/photos/a-sign-on-the-side-of-a-building-that-says-growing-concerns-STDn0DxY8os?utm_source=unsplash&utm_medium=referral&utm_content=creditCopyText">Unsplash</a>
+      
 
 ## GitHub Copilot CLI plugin marketplace
 
@@ -142,7 +154,7 @@ The pattern across all of them is that the per-developer experience is great, th
 
 If you are responsible for any of this in a larger org, the short version of what I would do:
 
-1. Decide which of these surfaces you want your developers to use at all. Default-allow is a choice with consequences, not a neutral starting point.
+1. Decide which of these surfaces you want your developers to use at all. Default-allow is a choice that has consequences, not a neutral starting point.
 2. For the ones you allow, pick the strongest available control today (VS Code extension policy, the Copilot MCP registry, an APM policy file) and ship it.
 3. For the ones with no control today (CLI plugins, `gh skill`), at minimum log and review, and feed back to GitHub and Microsoft that this gap matters.
 Overall, tighten your grip on endpoint protection and your firewall/proxy configurations.
