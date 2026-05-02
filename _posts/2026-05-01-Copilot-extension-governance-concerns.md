@@ -19,9 +19,9 @@ copilot plugin install some-plugin@some-marketplace
 
 A marketplace is just a GitHub repository with a `marketplace.json` file in `.github/plugin/`. There is no review, no signing, no central index. Two marketplaces (`copilot-plugins` and `awesome-copilot`) are registered by default, but any user can add any other repo, including a personal fork or a newly created account that copies a real plugin name with a small change.
 
-XXX review with versioning of these things!
+Versioning is the next gap. The [CLI plugin reference](https://docs.github.com/en/copilot/reference/cli-plugin-reference) has a `version` field in `plugin.json`, but the `copilot plugin install` command has no syntax to pin to a version. You install `OWNER/REPO`, `OWNER/REPO:PATH`, a Git URL, a local path, or `plugin@marketplace`, and you get whatever HEAD of the source happens to be at that moment. `copilot plugin update NAME` pulls latest. There is no lockfile, no SHA pinning like `gh skill` has, and no provenance attestation. A marketplace can change a plugin's contents without changing the `version` field and the next `update` will quietly bring it down to every developer who installed it.
 
-Plugins themselves are executable assets. They sit in the directory the marketplace points at, get pulled to the user's machine, and run in the user's shell context with whatever permissions the developer has. That is the same context as their git credentials, their cloud CLI sessions, and any local secrets in their environment.
+Plugins themselves are executable assets.They sit in the directory the marketplace points at, get pulled to the user's machine, and run in the user's shell context with whatever permissions the developer has. That is the same context as their git credentials, their cloud CLI sessions, and any local secrets in their environment.
 
 What is missing for an enterprise:
 
@@ -36,9 +36,7 @@ If you compare this to how npm or PyPI are usually handled in a regulated org (a
 
 [Microsoft APM](https://github.com/microsoft/apm) is a dependency manager for AI agent context. You declare an `apm.yml`, run `apm install`, and it pulls instructions, skills, prompts, agents, hooks, plugins, and MCP servers from any git host (GitHub, GitLab, Bitbucket, Azure DevOps, GitHub Enterprise) into every detected agent client on the machine.
 
-After installing you point it to a local configuration file (can be in the current repo as well!) like this:
-
-XXX: validate the repo part!
+The manifest lives in the repo itself (`apm.yml` and `apm.lock.yaml` are committed alongside the code, like `package.json` and `package-lock.json`). It looks like this:
 
 ```yaml
 dependencies:
@@ -53,18 +51,17 @@ dependencies:
 
 APM does ship a governance story, and it is genuinely better thought through than most of the other entries in this post. There is `apm-policy.yml` with tighten-only inheritance from enterprise to org to repo, a published bypass contract, hidden-Unicode scanning on every install, lockfile integrity hashes, and an `apm audit --ci` mode that you can wire into branch protection.
 
-The catch is that all of this governance is opt-in and lives outside of GitHub itself. A fresh install of `apm` on a developer laptop has no policy file. 
-XXX check how this trickles down from the org. Is that automatic from tracing the repo upstream?
+The catch is that all of this governance is opt-in and lives outside of GitHub itself. A fresh install of `apm` on a developer laptop has no policy file. Policy is also pull-only: the canonical org policy lives at `<org>/.github/apm-policy.yml` and the CLI fetches it on demand when a developer or CI job runs `apm install` or `apm audit --ci`. There is no push, no agent, and no central enrollment. The fetched policy is cached locally for an hour by default in `apm_modules/.policy-cache/`, and a `fetch_failure: warn|block` knob decides what happens when the org repo is unreachable. The default is `warn`, which means an offline laptop with an empty cache resolves with no policy at all. Repo-local `apm-policy.yml` files can `extends: org` and only **tighten** the parent rules, never relax them. See the [Policy Reference](https://microsoft.github.io/apm/enterprise/policy-reference/) and [Governance Guide](https://microsoft.github.io/apm/enterprise/governance-guide/) for the full mechanics.
 
-Until your security team writes one, publishes it, and gets it on every **single** machine, an `apm install` will happily resolve transitive dependencies from any reachable git host. And don’t worry: your CI/CD pipeline will do the same (if the tooling is already installed)!
+Until your security team writes one, publishes it, and gets it picked up on every machine, an `apm install` will happily resolve transitive dependencies from any reachable git host. And don't worry: your CI/CD pipeline will do the same (if the tooling is already installed)!
 
-XXX: check if the tooling can just be installed from inside a package config and be slipped in that way. 
+There is also no auto-install. APM is purely a CLI; it has no editor extension that runs `apm install` when you open a repo in VS Code. The docs frame it explicitly as "same as `npm install` after cloning a Node project", which means the install step relies on the developer running it (or a devcontainer `postCreateCommand`, or a CI job). The flip side is that the **deployed** files (under `.github/`, `.claude/`, `.cursor/`, `.gemini/`) are recommended to be committed, so a teammate who clones the repo gets the agent context immediately, before they ever run `apm install`. That is convenient and it also means the agent is reading APM-deployed content the moment the editor opens the repo, regardless of whether the local CLI was ever invoked.
 
-XXX: check versioning and updates
+APM packages can declare `scripts` (think npm scripts), and the policy reference exposes `manifest.scripts: allow|deny` precisely because of this risk. Default is `allow`. So an attacker who lands a package in your dependency tree can also land scripts, unless your org policy denies them outright.
 
-Direct and transitive resolution are the parts I would worry about: a package you trusted six months ago can pull in a new dependency on its next release and there is no central registry or policy that says "this source/version is approved".
+Versioning is fine on the manifest side: dependencies pin with `#tag` or `#sha`, the lockfile records resolved commit SHAs and content hashes, and the org policy can `require` specific versions with a `require_resolution` of `project-wins`, `policy-wins`, or `block`. Updates happen on `apm install --update`, not implicitly. Direct and transitive resolution stay the parts I would worry about: a package you trusted six months ago can pull in a new dependency on its next release, and unless your org policy has a tight `dependencies.allow` pattern, the new source slips through.
 
-The MCP integration deserves its own line: APM will install a configured MCP server into every detected client (Copilot, Claude, Cursor, Codex, OpenCode, Gemini) in one command. XXX: check this mechanism! That is convenient and it is also a way to push an MCP server past whatever per-client policy exists, because the install happens at the filesystem level instead of through the editor's own registry flow. You can only hope that the tooling that runs them looks at a policy (hint: only a few handle this, and then still with loads of caveats and easy workarounds). 
+The MCP integration deserves its own line. `apm install --mcp NAME` adds an entry under `dependencies.mcp` in `apm.yml` and writes the resolved server config straight into the native config file of every detected client (Copilot, Claude, Cursor, Codex, OpenCode, Gemini) on the filesystem. It is not going through any client's registry or policy layer; it is editing their config files directly. The full mechanism is documented in the [APM MCP Servers guide](https://microsoft.github.io/apm/guides/mcp-servers/). That is convenient and it is also a way to push an MCP server past whatever per-client policy exists. You can only hope that the tooling that runs them looks at a policy (hint: only a few handle this, and then still with loads of caveats and easy workarounds).
 
 ## `gh skill` now in the GitHub CLI
 Note: this is the **GitHub** CLI, not the GitHub **Copilot** CLI!
@@ -78,23 +75,23 @@ gh skill install some-user/some-repo some-skill --pin v1.0.0
 
 The supply-chain features here are better. Skills can be pinned to a tag (unsafe) or commit SHA, the install records the git tree SHA in the skill's frontmatter, `gh skill update` compares local SHAs against the remote, and `gh skill publish` will offer to enable [immutable releases](https://docs.github.com/repositories/releasing-projects-on-github/about-releases) so that even a repo admin cannot rewrite a published version.
 
-XXX: check for audit options here!
+Audit tooling is thin. The [`gh skill` manual](https://cli.github.com/manual/gh_skill) lists `install`, `preview`, `publish`, `search`, and `update` as the only subcommands. There is a `gh skill preview` to inspect a skill's content before installing, and `gh skill update` uses the stored tree SHA to detect drift, but there is no `gh skill audit` and no org-side audit log of what your developers installed. If you want to know which skills landed on a developer's laptop, you have to grep the agent host directories yourself.
 
-The thing that is not there is an org-level allowlist. GitHub itself is unusually direct about this in the changelog:
+The thing that is not there is an org-level allowlist.GitHub itself is unusually direct about this in the changelog:
 
 > Skills are installed at your own discretion. They are not verified by GitHub and may contain prompt injections, hidden instructions, or malicious scripts. We strongly recommend inspecting the content of skills before installation.
 
 So the tooling around a single skill is solid, the tooling around "which skills is my org allowed to use" is not. A developer can `gh skill install` from any public repo, and the agent host (Copilot, Claude Code, Cursor, Codex, Gemini, all the CLI options) will pick the skill up the next time it scans the directory. Skills are a first-class extension point for the agent's behavior, which means a malicious skill is closer to a custom system prompt than to a passive config file.
 
-XXX: check Dependabot support for detecting and thus reviewing updates. 
+Dependabot does not help here either: agent skills, MCP servers, APM packages, and Copilot CLI plugins are not on the [list of ecosystems Dependabot supports](https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories). So no automatic update PRs, no security advisories wired in, and no scheduled drift detection across these surfaces.
 
 ## MCP servers across editors
 
-This is the area where the situation has gotten more confusing rather than less, even though there has been real work on it. Back in March 2025 MCP exploded into the AI world: extensibility from anywhere into anything! Since then, a lot of servers and OSS repos turned about to be playing around with things. The hard part is that al those repos have since then been abandoned. Read the research on its stat here: XXX map EndorLabs review here. 
+This is the area where the situation has gotten more confusing rather than less, even though there has been real work on it. Back in March 2025 MCP exploded into the AI world: extensibility from anywhere into anything! Since then, a lot of servers and OSS repos turned out to be playing around with things. The hard part is that a large share of those repos have since been abandoned. Endor Labs covered this in its [State of Dependency Management 2025 report](https://www.endorlabs.com/learn/state-of-dependency-management-2025) (summary on the [Endor Labs press release](https://www.prnewswire.com/news-releases/endor-labs-launches-2025-state-of-dependency-management-report-finds-80-of-ai-suggested-dependencies-contain-risks-302603438.html)): more than 10,000 MCP servers were created in less than a year, 75% of them by individual developers rather than organizations, around 40% have no license at all, and 82% touch sensitive APIs. Maintenance signals on the long tail are weak, which means the same servers your developers happily installed last year may already be effectively orphaned.
 
 A short summary of where MCP server config lives today:
 
-- VS Code: `.vscode/mcp.json`, user `settings.json`, or contributed by an installed VS Code extension. XXX: check how APM does this on the repo level
+- VS Code: `.vscode/mcp.json` (workspace), the user-profile `mcp.json` opened via `MCP: Open User Configuration`, or contributed by an installed VS Code extension. The full schema is in the [VS Code MCP servers docs](https://code.visualstudio.com/docs/copilot/customization/mcp-servers). APM sits on top of this: it stores MCP servers in the repo's `apm.yml`, then writes them into the same `.vscode/mcp.json` file the editor reads. By default `apm install` does not overwrite locally-authored entries (that needs `--force`, per the [CLI reference](https://microsoft.github.io/apm/reference/cli-commands/)), so the file you end up with is APM's set **plus** anything that was already there. If a developer thinks "I'm only running the APM-managed servers", they are wrong: they are running APM-managed plus whatever they (or another tool) wrote into `mcp.json` previously.
 - Cursor, Windsurf, Codex, Claude Code, Gemini CLI, Copilot and other CLI’s: each has its own file in its own location, with its own schema variations.
 - The remote Copilot agents (Cloud Agent, Spark, Spaces, Review Agent) each have their own configuration surface and can only be configured by a repo admin. 
 
@@ -102,7 +99,7 @@ GitHub did ship an [MCP private registry policy](https://docs.github.com/en/copi
 
 Two patterns make the policy easier to bypass than it looks:
 
-1. Local stdio servers. The policy gates remote endpoints well, but a developer can drop a local MCP server config into their own user settings and the editor will start it without a registry check. XXX check this!
+1. Local stdio servers. The [VS Code MCP docs](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) describe three config paths: the gallery flow (which the Copilot private registry can gate), the workspace `.vscode/mcp.json`, and the user-profile `mcp.json`. The registry policy applies to the gallery flow. A developer who edits either JSON file directly gets a one-time "trust this server" prompt and the server starts. There is a separate VS Code device-management policy that can disable MCP entirely, but it is on/off, not allowlist-aware. See [extension runtime security](https://code.visualstudio.com/docs/configure/extensions/extension-runtime-security) for the surrounding policy surface.
 2. Extension-contributed servers. A VS Code extension can contribute MCP servers through its manifest. If an extension is allowed to install (and most orgs do not gate extensions tightly, see the next section), the MCP servers it contributes inherit the same trust as the extension itself. That sidesteps the registry policy entirely.
 
 Even worse: clone the extension repo from github.com, build it, and just use the compiled VSIX file in VS Code!
@@ -115,7 +112,7 @@ The extension story is the oldest of the five, and it is the one that has change
 
 - The Microsoft Visual Studio Marketplace is closed to non-Microsoft products by its terms of use. Any VS Code fork (Cursor, Windsurf, VSCodium, Kiro, Antigravity, Positron) cannot legally use it.
 - Those forks generally point at [Open VSX](https://open-vsx.org/), the Eclipse Foundation registry. Open VSX has a smaller catalog, less aggressive abuse handling historically, and a publish flow that is easier to ride.
-- In 2026 the Eclipse Foundation launched the Open VSX Managed Registry as an SLA-backed paid tier, partly because the volume coming from AI editors started exceeding what the community instance could carry. XXX: check this!
+- On April 21, 2026 the Eclipse Foundation [launched the Open VSX Managed Registry](https://newsroom.eclipse.org/news/announcements/eclipse-foundation-launches-open-vsx-managed-registry-0) as an SLA-backed paid tier (99.95% uptime, defined support tiers), with AWS, Google, and Cursor as initial adopters. The launch numbers paint the scale: 300M+ downloads per month, 200M+ daily requests at peak, 12,000+ extensions, 8,000+ publishers. The community instance was being asked to do the job of always-on critical infrastructure, and the AI editors are most of the reason.
 
 For an org this means the threat model differs by editor, even when the developer thinks they are installing "the same extension". A name on the Microsoft Marketplace is not necessarily owned by the same publisher on Open VSX. Typosquats and copy-jobs of popular extensions show up regularly on both registries, and an extension is essentially arbitrary code in your editor process with access to your workspace files, your environment, and any tokens the editor holds.
 
@@ -127,7 +124,7 @@ What helps in practice:
 - Mirroring Open VSX internally if you support fork editors, with a curated subset rather than a full passthrough.
 - Treating new extension installs the same way you treat new npm dependencies: review, scan, and budget for the maintenance.
 
-XXX: add a paragraph on endpoint protection here. And check Jesse Houwing’s blog for a relevant post!
+Endpoint protection is the layer that catches what the registries miss. Even the official VS Code documentation on [extension runtime security](https://code.visualstudio.com/docs/configure/extensions/extension-runtime-security) is direct that an extension runs with the user's full permissions: it can read and write any file the editor can, spawn processes, and make network calls. The Marketplace does scan packages and verify signatures (see the Microsoft post on [security and trust in the Visual Studio Marketplace](https://developer.microsoft.com/blog/security-and-trust-in-visual-studio-marketplace)), but malicious extensions and credential-stealing supply chain incidents keep landing (see the [Wiz writeup on supply chain risk in VS Code extension marketplaces](https://www.wiz.io/blog/supply-chain-risk-in-vscode-extension-marketplaces) and Check Point's [report on 45,000+ downloads of malicious extensions](https://blog.checkpoint.com/securing-the-cloud/malicious-vscode-extensions-with-more-than-45k-downloads-steal-pii-and-enable-backdoors/)). For an org that means the controls have to live below the editor: managed device policy that blocks unsigned binaries, EDR that watches the editor's process tree the same way it watches a browser, outbound DNS and TLS inspection that can flag the unusual call patterns an extension makes, and a workstation lifecycle that assumes a compromised editor is one of the realistic incidents you respond to. Third-party scanners like [ExtensionTotal](https://extensiontotal.com) can give you a per-extension risk score before you allow it, but they sit on top of, not instead of, your endpoint stack.
 
 ## State of the plugin landscape for GitHub Copilot
 
