@@ -138,6 +138,24 @@ What helps in practice:
 
 Endpoint protection is the layer that catches what the registries miss. Even the official VS Code documentation on [extension runtime security](https://code.visualstudio.com/docs/configure/extensions/extension-runtime-security) is direct that an extension runs with the user's full permissions: it can read and write any file the editor can, spawn processes, and make network calls. The Marketplace does scan packages and verify signatures (see the Microsoft post on [security and trust in the Visual Studio Marketplace](https://developer.microsoft.com/blog/security-and-trust-in-visual-studio-marketplace)), but malicious extensions and credential-stealing supply chain incidents keep landing (see the [Wiz writeup on supply chain risk in VS Code extension marketplaces](https://www.wiz.io/blog/supply-chain-risk-in-vscode-extension-marketplaces) and Check Point's [report on 45,000+ downloads of malicious extensions](https://blog.checkpoint.com/securing-the-cloud/malicious-vscode-extensions-with-more-than-45k-downloads-steal-pii-and-enable-backdoors/)). For an org that means the controls have to live below the editor: managed device policy that blocks unsigned binaries, EDR that watches the editor's process tree the same way it watches a browser, outbound DNS and TLS inspection that can flag the unusual call patterns an extension makes, and a workstation lifecycle that assumes a compromised editor is one of the realistic incidents you respond to. Third-party scanners like [ExtensionTotal](https://extensiontotal.com) can give you a per-extension risk score before you allow it, but treat them as an addition to your endpoint stack rather than a substitute.
 
+## New: VS Code enterprise policy updates
+
+VS Code shipped a notable batch of new enterprise policies around late April 2026 (documented at [code.visualstudio.com/docs/enterprise/policies](https://code.visualstudio.com/docs/enterprise/policies)) that start closing some of the gaps described above. The most relevant additions:
+
+**MCP server control** — `ChatMCP` (`chat.mcp.access`) lets an admin disable access to all installed MCP servers via device policy. This is a blunter but more reliable control than the Copilot private registry alone, because it applies regardless of how the server was registered.
+
+**Network filtering for agent tools** — `ChatAgentNetworkFilter`, `ChatAgentAllowedNetworkDomains`, and `ChatAgentDeniedNetworkDomains` let you restrict which hosts an agent's fetch tool and integrated browser can reach. Combined with `ChatAgentSandboxEnabled`, which runs terminal commands in a sandboxed environment, this starts to limit the blast radius of a compromised or malicious tool.
+
+**Agent tool approval** — `ChatToolsAutoApprove` lets you lock down the "YOLO mode" (`chat.tools.global.autoApprove`) at the org level so individual developers cannot enable it, and `ChatToolsEligibleForAutoApproval` lets you force specific tools to always require manual confirmation.
+
+**Account-gated AI access** — `ChatApprovedAccountOrganizations` blocks all AI features until the user signs into a GitHub account belonging to an approved organization. Useful for contractors, BYOD, and split environments where you need to tie the Copilot seat to an identity your org controls before anything runs.
+
+**Linux policy support** — VS Code 1.106 added a `/etc/vscode/policy.json` file for Linux devices, meaning the same policies you deploy on Windows and macOS via ADMX or `.mobileconfig` can now cover Linux developer workstations through your existing config management tooling (Ansible, Puppet, Chef, Salt).
+
+**Policy diagnostics** — A new `Developer: Policy Diagnostics` command generates a Markdown report of which policies are active, what values are in effect, and whether the Account Policy Gate is satisfied or blocked. Useful when you need to prove to an auditor — or a confused developer — exactly what the machine is enforcing.
+
+These additions meaningfully strengthen the VS Code row in the summary table below. The gaps at the Copilot CLI, `gh skill`, and cross-editor MCP layers remain open.
+
 ## State of the plugin governance for GitHub Copilot
 
 If I line up the different surfaces by how much org-level governance is actually possible today:
