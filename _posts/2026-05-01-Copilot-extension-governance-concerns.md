@@ -10,6 +10,7 @@ A lot of the recent additions to the GitHub Copilot ecosystem add real value for
 
 We'll look at these topis:
 - GitHub Copilot CLI plugin marketplace
+- GitHub Copilot CLI local extensions
 - Agent Package Manager (APM)
 - `gh skill` now in the GitHub CLI
 - MCP servers across editors
@@ -43,6 +44,36 @@ What is missing for an enterprise:
 - Clear versioning out of the box. preferably with provenance signing build in. 
 
 If you compare this to how npm or PyPI are usually handled in a regulated org (a private proxy, an allowlist, a vulnerability scanner in the pipeline), the Copilot CLI plugin story today is roughly where npm was around 2014.
+
+## GitHub Copilot CLI local extensions
+
+Beyond the plugin marketplace there is a second, almost entirely undocumented extension surface baked into the Copilot CLI: the `.github/extensions/` directory. [A detailed reverse-engineering writeup by htek.dev](https://htek.dev/articles/github-copilot-cli-extensions-complete-guide/) extracted this from the Copilot SDK source, because there is essentially no public documentation for it. The architecture is that the CLI discovers any subdirectory containing an `extension.mjs` file, forks it as a child Node.js process, and communicates with it over JSON-RPC via stdio. The extension calls `joinSession()` and gets back a live session object that lets it register custom tools, intercept every agent lifecycle event, rewrite prompts, and make permission decisions.
+
+The lifecycle hooks are the part that matters from a governance angle:
+
+- `onSessionStart` — inject context into every session before the user's first message
+- `onUserPromptSubmitted` — rewrite or augment the user's prompt before the agent sees it
+- `onPreToolUse` — approve, deny, or modify the arguments of any tool call before it executes
+- `onPostToolUse` — react after any tool completes, inject feedback the agent acts on
+- `onErrorOccurred` — decide whether to retry, skip, or abort on failure
+
+The `onPermissionRequest` handler in the `joinSession()` call replaces the standard user confirmation prompt for every tool execution. The SDK ships an `approveAll` import that does exactly what it sounds like: pass it and the extension silently approves every shell command, file write, and network call without showing the user a prompt.
+
+The discovery paths are what make this a fleet-wide concern:
+
+1. **Project-scoped**: `.github/extensions/` is committed to the repo. Cloning the repo means the extensions are live the next time any developer opens a CLI session in that directory. No `install` step. No opt-in. The moment the CLI opens the project, it forks whatever `.mjs` files are in that folder.
+2. **User-scoped**: `~/.copilot/extensions/` applies to every repo on the developer's machine. An extension installed once here runs against every project that developer ever opens in the Copilot CLI, with no per-project awareness or consent.
+
+Project extensions shadow user extensions on name collision, and the load order across extensions is not guaranteed — combined with a [known bug](https://github.com/github/copilot-cli/issues/2076) where multiple extensions registering hooks results in only the last-loaded extension's hooks actually firing, this creates silent behavior that is hard to audit even locally.
+
+What is missing for an enterprise:
+
+- No org-level allowlist. Any `.github/extensions/` directory in any repo a developer clones will have its extensions activated with no central gate.
+- No signing or publisher verification. An extension is an arbitrary `.mjs` file on disk.
+- No audit trail. The CLI does not log which extensions ran in a session or what hooks they fired.
+- No policy to restrict which `onPermissionRequest` handlers can suppress user prompts. A malicious or compromised extension can run `approveAll` and the developer sees nothing different.
+
+The feature is legitimately useful: teams can enforce architecture rules, block destructive commands, run linters after edits, and build self-healing test loops. But those same capabilities — prompt rewriting, permission suppression, tool argument modification — are exactly what a supply-chain attack would want, and right now there is no org-level control surface at all.
 
 ## Agent Package Manager (APM)
 
@@ -163,6 +194,7 @@ If I line up the different surfaces by how much org-level governance is actually
 | Surface | Org-level allowlist | Provenance / pinning | Notes |
 | --- | --- | --- | --- |
 | Copilot CLI plugin marketplace | None | None | Any GitHub repo can be a marketplace |
+| Copilot CLI local extensions | None | None | Committed to repo; active on clone with no install step |
 | APM | Yes, via `apm-policy.yml` | Lockfile + content hashes | Policy is opt-in, customer-owned |
 | `gh skill` | None | Tag and SHA pinning | GitHub explicitly mentions verification |
 | MCP servers | Limited (Copilot in VS Code only) | None standardized | Local stdio and extension-contributed servers bypass the policy |
