@@ -6,8 +6,6 @@ tags: [GitHub Copilot, AI]
 description: "An overview of a mistake made with AI"
 ---
 
-# Shooting yourself in the foot with AI
-
 Today I had a fun one, where I finally dove into something that was bothering me for days: since a couple of days I had been getting questions from my different GitHub Copilot sessions to close some GitHub nofications, and only from a very specific type of notification: deployment statuses.
 
 ![Screenshot of the AI asking to cleanup notifications](/images/2026/20260508/20260508_NotificationMessages.png)
