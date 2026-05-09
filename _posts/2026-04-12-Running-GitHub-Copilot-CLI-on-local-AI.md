@@ -2,7 +2,7 @@
 layout: post
 title: Running GitHub Copilot CLI on local AI inference
 date: 2026-04-12
-tags: [GitHub, GitHub Copilot, Generative AI, Local AI, Ollama, LM Studio, Foundry Local, HuggingFace, vLLM, TGI, Docker, PowerShell, Windows]
+tags: [GitHub, GitHub Copilot, Generative AI, Local AI, Ollama, LM Studio, Foundry Local, HuggingFace, vLLM, TGI, llama.cpp, Docker, PowerShell, Windows]
 description: "A walkthrough of running the GitHub Copilot CLI against local AI inference engines on a Dell Pro Max 14 with Intel Arc 140T, NVIDIA RTX PRO 500, and Intel AI Boost NPU. Covers Ollama, LM Studio, Foundry Local, vLLM, and TGI — what worked, what didn't, and the fastest setup found."
 ---
 
@@ -207,6 +207,79 @@ There's also a WSL2 Triton linker bug that needs `-e LIBRARY_PATH=/usr/local/cud
 
 ---
 
+## llama.cpp — fastest raw CUDA inference
+
+After publishing the initial results, I got a tip to try llama.cpp directly — not through LM Studio's wrapper, but as a standalone server with the native CUDA build. LM Studio uses llama.cpp under the hood but adds process management overhead and restricts some server flags. Running llama.cpp directly gives you tighter control over Flash Attention, KV cache precision, and context window allocation.
+
+### Installation (CUDA build on Windows)
+
+`winget install ggml.llamacpp` installs the **Vulkan** build, not CUDA. For the CUDA build, download from the [llama.cpp GitHub releases](https://github.com/ggml-org/llama.cpp/releases) directly:
+
+```powershell
+$dest = "$env:LOCALAPPDATA\llama.cpp"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+# CUDA 12.4 build — works fine with CUDA 13.0 driver (backward compatible)
+Invoke-WebRequest "https://github.com/ggml-org/llama.cpp/releases/download/b9075/llama-b9075-bin-win-cuda-12.4-x64.zip" -OutFile "$env:TEMP\llama-cuda.zip"
+Invoke-WebRequest "https://github.com/ggml-org/llama.cpp/releases/download/b9075/cudart-llama-bin-win-cuda-12.4-x64.zip" -OutFile "$env:TEMP\llama-cudart.zip"
+Expand-Archive "$env:TEMP\llama-cuda.zip" -DestinationPath $dest -Force
+Expand-Archive "$env:TEMP\llama-cudart.zip" -DestinationPath $dest -Force
+```
+
+> **Flash Attention syntax changed in build b9075+:** `--flash-attn` is no longer a bare flag. You must write `--flash-attn on`.
+
+### Starting the server
+
+llama.cpp loads GGUF files directly from the LM Studio model cache — no re-download needed:
+
+```powershell
+$model = "$env:USERPROFILE\.lmstudio\models\bartowski\Qwen2.5-7B-Instruct-GGUF\Qwen2.5-7B-Instruct-Q4_K_S.gguf"
+& "$env:LOCALAPPDATA\llama.cpp\llama-server.exe" `
+    --model $model --alias Qwen2.5-7B-Instruct-Q4_K_S `
+    --n-gpu-layers 999 --ctx-size 32768 `
+    --cache-type-k q8_0 --cache-type-v q8_0 `
+    --flash-attn on `
+    --host 127.0.0.1 --port 8088
+```
+
+The `--cache-type-k q8_0 --cache-type-v q8_0` flags compress the KV cache to 8-bit precision. At 32k context this saves ~896 MB — exactly the headroom needed to fit Q4_K_S weights alongside a 32k context in 6 GB VRAM:
+
+> 4.15 GB (weights) + 0.9 GB (q8_0 KV @ 32k) + ~0.4 GB (CUDA overhead) ≈ **5.45 GB total** — ~550 MB headroom in 6 GB VRAM.
+
+### Copilot CLI configuration
+
+```powershell
+$env:COPILOT_PROVIDER_BASE_URL         = "http://127.0.0.1:8088/v1"
+$env:COPILOT_MODEL                      = "Qwen2.5-7B-Instruct-Q4_K_S"
+$env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS = "32768"  # must match --ctx-size exactly
+$env:COPILOT_PROVIDER_MAX_OUTPUT_TOKENS = "8192"
+```
+
+`COPILOT_PROVIDER_MAX_PROMPT_TOKENS` must match your `--ctx-size` exactly. Leaving it at the default 8192 while the server runs a 32k context gives:
+```
+400 request (22704 tokens) exceeds the available context size (8192 tokens)
+```
+
+### Result: 23.0 tok/s 🏆
+
+**23.0 tok/s** — faster than Ollama Qwen3-8B and nearly 2× faster than Ollama Qwen2.5-7B (12.3 tok/s). The same GGUF file, the same GPU, just running through llama.cpp's direct CUDA path instead of Ollama's management layer — with Flash Attention and 8-bit KV cache enabled.
+
+**llama.cpp verdict:** ✅ New fastest setup at 23.0 tok/s. It reuses GGUF files already in your LM Studio model cache, so there's no re-download needed — just the extra setup steps for the CUDA binary.
+
+### Bonus: Vulkan tensor split across NVIDIA + Intel Arc
+
+I also tried the Vulkan build to see if offloading layers to the Intel Arc 140T's 18 GB of shared memory would improve throughput. The device order on this machine:
+
+```
+Vulkan0: Intel Arc 140T  — 18 GB (shared system RAM)
+Vulkan1: NVIDIA RTX PRO 500 — 6 GB dedicated GDDR7
+```
+
+Results with `--tensor-split 1,4` (≈20% Arc / ≈80% NVIDIA): **22.1 tok/s** — essentially identical to NVIDIA-only Vulkan (22.3 tok/s) and slightly below the CUDA build (23.0 tok/s). No throughput improvement.
+
+The reason: "shared memory" on the Arc iGPU is system RAM accessed through the memory controller — roughly 10× slower than GDDR7. The model (4.15 GB) already fits fully in dedicated VRAM, so there are no layers to gain by involving the Arc. Adding inter-GPU synchronisation only adds overhead. The 18 GB number in Task Manager looks tempting, but it only helps when a model doesn't fit in dedicated VRAM at all.
+
+---
+
 ## The PowerShell profile setup
 
 After going through all of this I set up a clean way to switch between providers from any terminal session. The `set-copilot-local` function gives you an interactive arrow-key menu to pick provider and model. `online-copilot` clears everything back to defaults.
@@ -365,7 +438,8 @@ The main functions that I use here is `set-copilot-local` for when I want to swi
 | Option | Status | Notes |
 |---|---|---|
 | `online-copilot` (GitHub-hosted Claude/GPT) | ✅ Best | Default, no setup needed |
-| Ollama `qwen3:8b` on NVIDIA | ✅ Works | **22.1 tok/s** — fastest model on this machine 🏆 |
+| llama.cpp `qwen2.5-7b-instruct@q4_k_s`, CUDA, 32k, q8_0 KV | ✅ Works | **23.0 tok/s** — fastest local model 🏆 |
+| Ollama `qwen3:8b` on NVIDIA | ✅ Works | **22.1 tok/s** — fastest local model before llama.cpp |
 | LM Studio `qwen2.5-7b-instruct@q4_k_s`, `--gpu 0.78` | ✅ Works | **15.2 tok/s** — fastest 7B in LM Studio |
 | LM Studio `qwen2.5-7b-instruct@q5_k_m`, 25 layers NVIDIA + CPU | ✅ Works | 13.6 tok/s |
 | Ollama `qwen2.5:7b-instruct-32k` on NVIDIA | ✅ Works | 12.3 tok/s |
@@ -380,7 +454,7 @@ The main functions that I use here is `set-copilot-local` for when I want to swi
 
 Speed matters for interactive use. The Copilot CLI generates structured JSON for tool calls, thinks through multi-step plans, and writes code — all of which require hundreds of tokens of output per turn. Anything below ~8 tok/s starts to feel noticeably slow for a CLI tool.
 
-I measured output throughput (tokens per second) using a standardised benchmark: each provider was asked to generate a ~250-token PowerShell function, at `temperature=0.2` with `max_tokens=400`, repeated 5 times after a warm-up run. The warm-up run loads the model into VRAM and warms the KV cache; only the subsequent timed runs are averaged.
+I measured output throughput (tokens per second) using a standardised benchmark: each provider was asked to generate a ~250-token PowerShell function, at `temperature=0.2` with `max_tokens=400`, repeated 3 times after a warm-up run. The warm-up run loads the model into VRAM and warms the KV cache; only the subsequent timed runs are averaged.
 
 The test prompt is a fixed PowerShell coding task so every provider generates a roughly comparable amount of output. This measures **output throughput** (decode speed) — which is what you feel as the response streaming in — not prompt processing speed or time-to-first-token.
 
@@ -393,20 +467,25 @@ The script is available as a Gist: [`Measure-LocalAIThroughput.ps1`](https://gis
 | Foundry Local | `qwen2.5-1.5b-instruct-cuda-gpu:4` | **117** | NVIDIA RTX PRO 500 CUDA — **1.5B model** (not comparable to 7B/8B rows) |
 | Ollama (1.5B) | `qwen2.5:1.5b-instruct-32k` | **55.3** | NVIDIA RTX PRO 500 CUDA, 32k context — **1.5B model** |
 | LM Studio (1.5B) | `qwen2.5-coder-1.5b-instruct` | **49.8** | NVIDIA RTX PRO 500 CUDA full offload — **1.5B model** |
-| **Ollama (Qwen3-8B)** | `qwen3:8b` | **22.1** | NVIDIA RTX PRO 500 CUDA, 32k context — **fastest 7B/8B overall** 🏆 |
+| **llama.cpp (CUDA)** | `qwen2.5-7b-instruct@q4_k_s` | **23.0** | CUDA, Flash Attention, 32k ctx, q8_0 KV cache — **fastest 7B overall** 🏆 |
+| **Ollama (Qwen3-8B)** | `qwen3:8b` | **22.1** | NVIDIA RTX PRO 500 CUDA, 32k context |
+| llama.cpp (Vulkan/NVIDIA) | `qwen2.5-7b-instruct@q4_k_s` | **22.3** | Vulkan build, NVIDIA RTX PRO 500 only |
+| llama.cpp (Vulkan/split) | `qwen2.5-7b-instruct@q4_k_s` | **22.1** | Vulkan, tensor-split 1:4 across Arc + NVIDIA — no benefit vs NVIDIA-only |
 | LM Studio (7B) | `qwen2.5-7b-instruct@q4_k_s` | **15.2** | `--gpu 0.78` (25/32 layers NVIDIA GDDR), 32k context |
 | Ollama (7B) | `qwen2.5:7b-instruct-32k` | **12.3** | NVIDIA RTX PRO 500 CUDA, 32k context |
-| vLLM (Docker) | `Qwen2.5-7B-Instruct-AWQ` | **2.6** | AWQ-Marlin + FlashAttention v2; `--cpu-offload-gb 2` bottleneck on 6 GB |
+| vLLM (Docker) | `Qwen2.5-7B-Instruct-AWQ` | **2.5** | AWQ-Marlin + FlashAttention v2; `--cpu-offload-gb 2` bottleneck on 6 GB |
 
 A few things to note from these numbers:
 
 - **Foundry Local at 117 tok/s** looks spectacular but it's running a 1.5B model — not capable enough for agentic tasks. Still, it's a preview of what the numbers could look like once the Arc 140T OpenVINO path is unblocked: running a proper 7B model on 16 GB VRAM with no memory pressure.
-- **Ollama Qwen3-8B at 22.1 tok/s** is the new overall winner for usable models. Qwen3-8B is a newer architecture than Qwen2.5-7B and fits fully into the 6 GB NVIDIA VRAM (Q4_K_M = 4.68 GB, leaving room for KV cache and overhead). Ollama handles the 128k-capable model natively without needing a custom Modelfile. LM Studio's Q4_K_M variant fails to load — the 4.68 GB weights plus LM Studio's per-process overhead pushes it over the 6 GB limit; Q3 quantisation would be needed there.
-- **LM Studio Q4_K_S at 15.2 tok/s** remains the fastest 7B option and a solid fallback. The `--gpu 0.78` flag is the key — without it, `--gpu max` silently falls back to CPU when the model + 32k KV cache don't fit together, dropping to ~2 tok/s.
+- **llama.cpp CUDA at 23.0 tok/s** is the new overall winner. The same Q4_K_S GGUF that LM Studio runs, launched directly via llama.cpp with Flash Attention and 8-bit KV cache — no management overhead, no restricted flags. Nearly 2× faster than Ollama Qwen2.5-7B on the same hardware.
+- **Ollama Qwen3-8B at 22.1 tok/s** is the runner-up. Qwen3-8B is a newer architecture than Qwen2.5-7B and fits fully into the 6 GB NVIDIA VRAM (Q4_K_M = 4.68 GB, leaving room for KV cache and overhead). Ollama handles the 128k-capable model natively without needing a custom Modelfile. LM Studio's Q4_K_M variant fails to load — the 4.68 GB weights plus LM Studio's per-process overhead pushes it over the 6 GB limit; Q3 quantisation would be needed there.
+- **llama.cpp Vulkan tensor split at 22.1 tok/s** is essentially identical to NVIDIA-only Vulkan (22.3 tok/s). The Intel Arc 140T's "18 GB shared memory" is system RAM — adding it only introduces inter-GPU synchronisation overhead when the model already fits in dedicated VRAM.
+- **LM Studio Q4_K_S at 15.2 tok/s** remains the fastest GUI-based option and a solid fallback. The `--gpu 0.78` flag is the key — without it, `--gpu max` silently falls back to CPU when the model + 32k KV cache don't fit together, dropping to ~2 tok/s.
 - **LM Studio Q5_K_M at 13.6 tok/s** and **Ollama 7B at 12.3 tok/s** are the most stable lower-tier options. Ollama's `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` settings are important — without them the KV cache alone takes 1.75 GB of VRAM, reducing model layers on GPU and dropping throughput to ~9 tok/s.
-- **vLLM at 2.6 tok/s** uses AWQ-Marlin kernels and FlashAttention v2 — theoretically the fastest inference stack available. But on 6 GB you need `--cpu-offload-gb 2`, which means 2 GiB of weight layers cross the PCIe bus every single token. The framework overhead cancels out the kernel advantage entirely.
+- **vLLM at 2.5 tok/s** uses AWQ-Marlin kernels and FlashAttention v2 — theoretically the fastest inference stack available. But on 6 GB you need `--cpu-offload-gb 2`, which means 2 GiB of weight layers cross the PCIe bus every single token. The framework overhead cancels out the kernel advantage entirely.
 - **You cannot run Ollama and LM Studio at the same time** on this machine. Both want to load the model weights into NVIDIA's 6 GB VRAM. The benchmark script handles this automatically.
-- For context: online Claude 3.5 Sonnet generates at 80–100+ tok/s. Local 7B/8B models at 12–22 tok/s are usable but noticeably slower for multi-step agentic work.
+- For context: online Claude 3.5 Sonnet generates at 80–100+ tok/s. Local 7B/8B models at 12–23 tok/s are usable but noticeably slower for multi-step agentic work.
 
 ---
 
@@ -414,25 +493,25 @@ A few things to note from these numbers:
 
 Based on all the testing, the fastest practical setup for running GitHub Copilot CLI locally on this Dell Pro Max 14 is:
 
-**Ollama with `qwen3:8b`** → **22.1 tok/s** 🏆
+**llama.cpp (CUDA) with `qwen2.5-7b-instruct@q4_k_s`** → **23.0 tok/s** 🏆
 
 The key steps:
 
-1. Install Ollama: `winget install Ollama.Ollama`
-2. Pull the model: `ollama pull qwen3:8b`
-3. Set environment variables and switch Copilot CLI: `set-copilot-local` → Ollama → qwen3:8b
+1. Download the CUDA build from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) and extract to `%LOCALAPPDATA%\llama.cpp\`
+2. Start the server: `llama-server.exe --model <path-to-gguf> --n-gpu-layers 999 --ctx-size 32768 --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --host 127.0.0.1 --port 8088`
+3. Set environment variables: `$env:COPILOT_PROVIDER_BASE_URL = "http://127.0.0.1:8088/v1"`, `$env:COPILOT_MODEL = "Qwen2.5-7B-Instruct-Q4_K_S"`, `$env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS = "32768"`
 
-No Modelfile needed — Ollama ships `qwen3:8b` with a 128k context window built in. No GPU fraction tuning either: at Q4_K_M (4.68 GB), the full model fits in 6 GB NVIDIA VRAM with room for KV cache and overhead.
+The GGUF file can be reused from your LM Studio model cache — no re-download needed.
 
-The previous winner — **LM Studio with `qwen2.5-7b-instruct@q4_k_s --gpu 0.78`** at **15.2 tok/s** — is still a great fallback if you prefer LM Studio's UI or want to experiment with other models. The `--gpu 0.78` flag remains critical there: `--gpu max` silently falls back to CPU when model weights plus 32k KV cache don't fit together in 6 GB.
+**Easiest local setup:** If you don't want to manage a separate server process, **Ollama with `qwen3:8b`** → **22.1 tok/s** is the runner-up with a much simpler setup: `winget install Ollama.Ollama` + `ollama pull qwen3:8b` + `set-copilot-local`. No binary downloads, no server management, and only ~5% slower.
 
-> **Real-world caveat:** These numbers are from a synthetic benchmark (5 runs × 400 tokens, fixed prompt). Real Copilot CLI sessions involve longer prompts, tool calls with JSON parsing, and multi-turn context accumulation — all of which affect throughput differently. I'll update this section after extended real-world use.
+> **Real-world caveat:** These numbers are from a synthetic benchmark (3 runs × 400 tokens, fixed prompt). Real Copilot CLI sessions involve longer prompts, tool calls with JSON parsing, and multi-turn context accumulation — all of which affect throughput differently. I'll update this section after extended real-world use.
 
 ---
 
 ## Final verdict on local inference options for GitHub Copilot CLI on this machine:
 
-**Ollama with `qwen3:8b`** is the best local option today at **22.1 tok/s** — nearly 2× faster than `qwen2.5-7b` on the same runtime (12.3 tok/s), and it beats LM Studio's 7B result (15.2 tok/s) too. The Qwen3 architecture simply uses the 6 GB NVIDIA VRAM more efficiently. LM Studio is a solid fallback at 15.2 tok/s if you prefer its tooling. The HuggingFace stack (vLLM, TGI) is currently impractical on 6 GB due to the need for CPU offload or lack of it, respectively.
+**llama.cpp (CUDA) with `qwen2.5-7b-instruct@q4_k_s`** is the best local option today at **23.0 tok/s** — beating Ollama Qwen3-8B (22.1 tok/s) and nearly 2× faster than Ollama Qwen2.5-7B (12.3 tok/s). The key insight is that llama.cpp's direct CUDA path with Flash Attention and 8-bit KV cache extracts more throughput from the same hardware and model file than any management layer on top. If you prefer a simpler setup, Ollama Qwen3-8B at 22.1 tok/s is an excellent runner-up with a one-line install. LM Studio is a solid GUI fallback at 15.2 tok/s. The HuggingFace stack (vLLM, TGI) is currently impractical on 6 GB due to the need for CPU offload or lack of it, respectively.
 
 Working with this from the Copilot CLI is workable, and of course it cannot compare to the powerful models that the hosting providers can run in the cloud. But for basic agentic tasks, code generation, and tool calling, it's a workable local setup.
 
@@ -440,4 +519,4 @@ Working with this from the Copilot CLI is workable, and of course it cannot comp
 
 The most promising path — Foundry Local with OpenVINO on the Arc 140T — is blocked by a single driver update. The Arc 140T has 16 GB of dedicated VRAM with Intel's optimised INT4 kernels via OpenVINO, and the 7B models should run fast and stable with no memory pressure. Once Dell publishes Arc driver 32.0.101.8629 for the MC14250, that's the first thing I'm testing.
 
-Until then, LM Studio with `qwen2.5-7b-instruct@q4_k_s --gpu 0.78` is the fastest local option. And for anything where quality actually matters, `online-copilot` is still the right call.
+Until then, llama.cpp (CUDA) with `qwen2.5-7b-instruct@q4_k_s` is the fastest local option at 23.0 tok/s — or Ollama `qwen3:8b` at 22.1 tok/s if you prefer a simpler setup. And for anything where quality actually matters, `online-copilot` is still the right call.
