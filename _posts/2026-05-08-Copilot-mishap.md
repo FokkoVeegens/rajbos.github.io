@@ -10,7 +10,7 @@ Today I had a fun one, where I finally dove into something that was bothering me
 
 ![Screenshot of the AI asking to cleanup notifications](/images/2026/20260508/20260508_NotificationMessages.png)
 
-I noticed I got these accross different projects, so I was tempted to blame the use of a new tool that recently got updated for this. I checked it low and wide on configuration, user system prompts, etc., even checked my copilot-instructions files, but nothing to be found. Already logged an error with the tool creator, thinking it was something they added without me telling them.
+I noticed I got these accross different projects, so I was tempted to blame the use of a new tool that recently got updated for this. I checked it low and wide on configuration, user system prompts, etc., even checked my copilot-instructions files, but nothing to be found. Already logged an error with the tool creator, thinking it was something they added without telling me.
 
 # Figuring out where this was coming from
 Of course I dropped into a Copilot CLI session to figure this one out. Somewhere, in one of my config files, either on the repo  or global level, this could have been added somewhere? Perhals a tool config, VS Code extension, or something else? 
